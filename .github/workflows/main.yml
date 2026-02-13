@@ -1,0 +1,96 @@
+name: Crawl GitHub Stars
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  crawl-stars:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github
+      GITHUB_TOKEN: ${{ github.token }}
+      PYTHONPATH: src
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: github
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d github"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wait for postgres service
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import psycopg
+
+          dsn = os.environ["DATABASE_URL"]
+          for attempt in range(1, 61):
+              try:
+                  with psycopg.connect(dsn):
+                      print("postgres is ready")
+                      break
+              except Exception as exc:
+                  if attempt == 60:
+                      raise RuntimeError(f"postgres did not become ready: {exc}") from exc
+                  time.sleep(2)
+          PY
+
+      - name: setup-postgres
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import psycopg
+
+          sql = Path("sql/schema.sql").read_text(encoding="utf-8")
+          with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(sql)
+              conn.commit()
+          print("schema initialized")
+          PY
+
+      - name: crawl-stars
+        run: |
+          python -m github_star_crawler --target-repos 100000
+
+      - name: Dump database contents
+        run: |
+          python scripts/export_db_dump.py \
+            --database-url "$DATABASE_URL" \
+            --output-dir artifacts/db_dump
+
+      - name: Upload database dump artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-stars-db-dump
+          path: artifacts/db_dump
+          if-no-files-found: error
